@@ -1,0 +1,90 @@
+trigger:
+  - main
+
+pool:
+  name: 'Default'          # Votre pool d'agents auto-hébergés (Azure DevOps Server)
+  # demands:
+  #   - Agent.OS -equals Windows_NT
+
+variables:
+  buildConfiguration: 'Release'
+  # Nom EXACT de la connexion de service de type "NuGet" (Project Settings > Service connections)
+  artifactoryServiceConnection: 'Artifactory-NuGet'
+  # Nombre minimal de paquets directs attendus après la restauration
+  minDirectPackages: 50
+  # Dossier de cache NuGet isolé et propre à chaque job : force le téléchargement
+  # réel depuis Artifactory (sinon un agent auto-hébergé réutilise ~/.nuget/packages).
+  NUGET_PACKAGES: '$(Agent.TempDirectory)/nuget-packages'
+
+steps:
+  # (Optionnel) Installe le SDK .NET. Nécessite un accès à Internet depuis l'agent ;
+  # sinon, supprimez cette étape et préinstallez le SDK sur l'agent.
+  - task: UseDotNet@2
+    displayName: 'Installer le SDK .NET 8'
+    inputs:
+      packageType: 'sdk'
+      version: '8.0.x'
+
+  # Restauration via nuget.config + identifiants de la connexion de service.
+  # --force et --no-cache : ignorent project.assets.json et le cache HTTP NuGet.
+  - task: DotNetCoreCLI@2
+    displayName: 'Restore (Artifactory)'
+    inputs:
+      command: 'restore'
+      projects: '**/*.csproj'
+      feedsToUse: 'config'
+      nugetConfigPath: 'nuget.config'
+      externalFeedCredentials: '$(artifactoryServiceConnection)'
+      arguments: '--force --no-cache --verbosity minimal'
+
+  # Contrôle : combien de paquets ont été restaurés ?
+  - task: PowerShell@2
+    displayName: 'Vérifier le nombre de paquets restaurés'
+    inputs:
+      targetType: 'inline'
+      script: |
+        $file = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Recurse -Filter project.assets.json | Select-Object -First 1
+        if (-not $file) { throw "project.assets.json introuvable : la restauration n'a rien produit." }
+
+        $assets = Get-Content -Raw $file.FullName | ConvertFrom-Json
+        $packages = @($assets.libraries.PSObject.Properties | Where-Object { $_.Value.type -eq 'package' })
+        $direct = @($assets.projectFileDependencyGroups.PSObject.Properties | Select-Object -First 1 -ExpandProperty Value)
+
+        Write-Host "Paquets directs     : $($direct.Count)"
+        Write-Host "Paquets au total    : $($packages.Count) (directs + transitifs)"
+
+        $cacheDir = $env:NUGET_PACKAGES
+        if (Test-Path $cacheDir) {
+          $onDisk = (Get-ChildItem $cacheDir -Directory).Count
+          Write-Host "Dossiers dans le cache isolé : $onDisk"
+        }
+
+        if ($direct.Count -lt [int]'$(minDirectPackages)') {
+          throw "Seulement $($direct.Count) paquets directs (minimum attendu : $(minDirectPackages))."
+        }
+        Write-Host "OK : restauration validée."
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Build'
+    inputs:
+      command: 'build'
+      projects: '**/*.csproj'
+      arguments: '--configuration $(buildConfiguration) --no-restore'
+
+  - task: DotNetCoreCLI@2
+    displayName: 'Run (validation)'
+    inputs:
+      command: 'run'
+      projects: '**/*.csproj'
+      arguments: '--configuration $(buildConfiguration) --no-build'
+
+# --- Alternative : NuGetAuthenticate + restore en ligne de commande ---
+# Utile si vous voulez garder un "dotnet restore" standard (ou plusieurs solutions).
+#
+#  - task: NuGetAuthenticate@1
+#    displayName: 'Authentification NuGet (Artifactory)'
+#    inputs:
+#      nuGetServiceConnections: '$(artifactoryServiceConnection)'
+#
+#  - script: dotnet restore --configfile nuget.config --force --no-cache
+#    displayName: 'dotnet restore'
